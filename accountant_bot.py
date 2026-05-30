@@ -525,7 +525,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if LILU_CHAT_ID:
                 await context.bot.send_message(
                     chat_id=LILU_CHAT_ID,
-                    text=f"💸 *Анастасия докладывает:*\n\nАртём вывел {'₽'+str(int(amount)) if is_rub else '$'+str(amount):.2f} с {name}\n\nОстатки обновлены в базе 📊",
+                    text=f"💸 *Анастасия докладывает:*\n\f"Артём вывел {'₽'+str(int(amount)) if is_rub else '$'+f'{amount:.2f}'} с {name}"\n\nОстатки обновлены в базе 📊",
                     parse_mode='Markdown'
                 )
             context.user_data.pop('withdraw_platform', None)
