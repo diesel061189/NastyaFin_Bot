@@ -536,7 +536,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def daily_report(app):
     while True:
         now = datetime.now()
-        next_9 = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        next_9 = now.replace(hour=6, minute=0, second=0, microsecond=0)  # 6 UTC = 9 MSK
         if now >= next_9:
             next_9 += timedelta(days=1)
         await asyncio.sleep((next_9 - now).total_seconds())
