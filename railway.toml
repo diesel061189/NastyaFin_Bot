@@ -1,7 +1,6 @@
 [build]
-builder = "NIXPACKS"
-buildCommand = "apt-get install -y ffmpeg || nixpacks add ffmpeg"
+builder = "nixpacks"
 
 [deploy]
-startCommand = "python bot.py"
-restartPolicyType = "ON_FAILURE"
+startCommand = "python accountant_bot.py"
+restartPolicyType = "always"
