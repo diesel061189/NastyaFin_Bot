@@ -19,7 +19,6 @@ DB_PATH = os.getenv("DB_PATH", "/tmp/freelance.db")
 USDT_WALLET = os.getenv("USDT_WALLET", "TECM5HuPvi9Z6RNzbHZLtesSkKwHBLJEJc")
 USD_RATE = 90.0
 
-# ═══ БИРЖИ / КОШЕЛЬКИ ═══
 PLATFORMS = {
     "guru": "🟠 Guru.com",
     "pph": "🔵 PeoplePerHour",
@@ -32,12 +31,9 @@ PLATFORMS = {
     "other": "💼 Другое",
 }
 
-# ═══ БАЗА ДАННЫХ ═══
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-
-    # Доходы
     c.execute('''CREATE TABLE IF NOT EXISTS earnings (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         job_id TEXT, amount_usd REAL, amount_rub REAL,
@@ -45,15 +41,11 @@ def init_db():
         status TEXT DEFAULT 'pending',
         date TEXT, paid_date TEXT
     )''')
-
-    # Расходы
     c.execute('''CREATE TABLE IF NOT EXISTS expenses (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         amount_usd REAL, amount_rub REAL,
         category TEXT, description TEXT, date TEXT
     )''')
-
-    # Кошельки по биржам
     c.execute('''CREATE TABLE IF NOT EXISTS wallets (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         platform TEXT UNIQUE,
@@ -63,19 +55,15 @@ def init_db():
         total_withdrawn_usd REAL DEFAULT 0,
         updated_at TEXT
     )''')
-
-    # История транзакций кошельков
     c.execute('''CREATE TABLE IF NOT EXISTS wallet_transactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         platform TEXT, type TEXT,
         amount_usd REAL, amount_rub REAL,
         description TEXT, date TEXT
     )''')
-
     conn.commit()
     conn.close()
 
-# ═══ КОШЕЛЬКИ ═══
 def get_wallets():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -84,7 +72,7 @@ def get_wallets():
     conn.close()
     return rows
 
-def update_wallet(platform: str, amount_usd: float, amount_rub: float, tx_type: str, description: str):
+def update_wallet(platform, amount_usd, amount_rub, tx_type, description):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('INSERT OR IGNORE INTO wallets (platform, balance_usd, balance_rub, total_earned_usd, total_withdrawn_usd, updated_at) VALUES (?, 0, 0, 0, 0, ?)',
@@ -100,7 +88,7 @@ def update_wallet(platform: str, amount_usd: float, amount_rub: float, tx_type: 
     conn.commit()
     conn.close()
 
-def get_wallet_history(platform: str = None):
+def get_wallet_history(platform=None):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     if platform:
@@ -111,7 +99,6 @@ def get_wallet_history(platform: str = None):
     conn.close()
     return rows
 
-# ═══ ДОХОДЫ / РАСХОДЫ ═══
 def add_earning(amount_usd, source, description, amount_rub=0):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -121,16 +108,17 @@ def add_earning(amount_usd, source, description, amount_rub=0):
               (amount_usd, amount_rub, source, description, datetime.now().isoformat()))
     conn.commit()
     conn.close()
-    # Пополняем кошелёк биржи
     update_wallet(source.lower().split('.')[0], amount_usd, amount_rub, 'earn', description)
 
 def add_expense(amount, category, description, is_rub=False):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     if is_rub:
-        amount_rub, amount_usd = amount, amount / USD_RATE
+        amount_rub = amount
+        amount_usd = amount / USD_RATE
     else:
-        amount_usd, amount_rub = amount, amount * USD_RATE
+        amount_usd = amount
+        amount_rub = amount * USD_RATE
     c.execute('INSERT INTO expenses (amount_usd, amount_rub, category, description, date) VALUES (?, ?, ?, ?, ?)',
               (amount_usd, amount_rub, category, description, datetime.now().isoformat()))
     conn.commit()
@@ -177,7 +165,7 @@ def get_stats(period="month"):
         'total_paid_usd': total_paid[0], 'total_paid_count': total_paid[1]
     }
 
-async def get_usd_rate() -> float:
+async def get_usd_rate():
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get("https://api.exchangerate-api.com/v4/latest/USD")
@@ -185,34 +173,35 @@ async def get_usd_rate() -> float:
     except:
         return 90.0
 
-# ═══ AI ОТЧЁТ ═══
-async def generate_report_for_lilu(stats: dict, wallets: list) -> str:
+async def generate_report_for_lilu(stats, wallets):
     wallet_text = "\n".join([f"{PLATFORMS.get(p, p)}: ${b:.2f}" for p, b, _, _, _ in wallets]) if wallets else "Кошельки пусты"
-    prompt = f"""Составь краткий финансовый отчёт для Лилы (генерального директора).
-
-ДАННЫЕ:
-Доходы за месяц: ${stats['earn_usd']:.2f} / ₽{stats['earn_rub']:.0f}
-Расходы: ${stats['exp_usd']:.2f}
-Прибыль: ${stats['profit_usd']:.2f}
-Заказов: {stats['earn_count']}
-Всего выплачено: ${stats['total_paid_usd']:.2f}
-
-Остатки по биржам:
-{wallet_text}
-
-Напиши отчёт 3-4 предложения. Деловой тон. Скажи что хорошо и что нужно улучшить."""
-
+    prompt = (
+        "Составь краткий финансовый отчёт для Лилы (генерального директора).\n\n"
+        "ДАННЫЕ:\n"
+        "Доходы за месяц: ${:.2f} / ₽{:.0f}\n"
+        "Расходы: ${:.2f}\n"
+        "Прибыль: ${:.2f}\n"
+        "Заказов: {}\n"
+        "Всего выплачено: ${:.2f}\n\n"
+        "Остатки по биржам:\n{}\n\n"
+        "Напиши отчёт 3-4 предложения. Деловой тон. Скажи что хорошо и что нужно улучшить."
+    ).format(
+        stats['earn_usd'], stats['earn_rub'],
+        stats['exp_usd'], stats['profit_usd'],
+        stats['earn_count'], stats['total_paid_usd'],
+        wallet_text
+    )
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            headers={"Authorization": "Bearer " + GROQ_API_KEY, "Content-Type": "application/json"},
             json={"model": "llama-3.3-70b-versatile",
                   "messages": [{"role": "user", "content": prompt}],
                   "max_tokens": 300}
         )
         return r.json()["choices"][0]["message"]["content"].strip()
 
-async def send_report_to_lilu(bot, stats: dict):
+async def send_report_to_lilu(bot, stats):
     if not LILU_CHAT_ID:
         return
     wallets = get_wallets()
@@ -221,33 +210,38 @@ async def send_report_to_lilu(bot, stats: dict):
     total_balance = 0
     for platform, bal_usd, bal_rub, earned, withdrawn in wallets:
         name = PLATFORMS.get(platform, platform)
-        wallet_lines += f"├ {name}: ${bal_usd:.2f} / ₽{bal_rub:.0f}\n"
+        wallet_lines += "├ {}: ${:.2f} / ₽{:.0f}\n".format(name, bal_usd, bal_rub)
         total_balance += bal_usd
 
-    msg = f"""📊 *ФИНАНСОВЫЙ ОТЧЁТ — АНАСТАСИЯ*
-_{datetime.now().strftime('%d.%m.%Y %H:%M')}_
-
-━━━━━━━━━━━━━━━━
-💰 *ДОХОДЫ (месяц)*
-├ USD: ${stats['earn_usd']:.2f}
-├ RUB: ₽{stats['earn_rub']:.0f}
-└ Заказов: {stats['earn_count']}
-
-💸 *РАСХОДЫ:* ${stats['exp_usd']:.2f}
-📈 *ПРИБЫЛЬ:* ${stats['profit_usd']:.2f} / ₽{stats['profit_rub']:.0f}
-
-━━━━━━━━━━━━━━━━
-🏦 *ОСТАТКИ ПО БИРЖАМ:*
-{wallet_lines if wallet_lines else '  Пусто'}
-💎 *ИТОГО НА БИРЖАХ:* ${total_balance:.2f}
-
-💳 *USDT кошелёк:*
-`{USDT_WALLET[:25]}...`
-
-━━━━━━━━━━━━━━━━
-🤖 *Анализ Анастасии:*
-{ai_summary}"""
-
+    msg = (
+        "📊 *ФИНАНСОВЫЙ ОТЧЁТ — АНАСТАСИЯ*\n"
+        "_{}_\n\n"
+        "━━━━━━━━━━━━━━━━\n"
+        "💰 *ДОХОДЫ (месяц)*\n"
+        "├ USD: ${:.2f}\n"
+        "├ RUB: ₽{:.0f}\n"
+        "└ Заказов: {}\n\n"
+        "💸 *РАСХОДЫ:* ${:.2f}\n"
+        "📈 *ПРИБЫЛЬ:* ${:.2f} / ₽{:.0f}\n\n"
+        "━━━━━━━━━━━━━━━━\n"
+        "🏦 *ОСТАТКИ ПО БИРЖАМ:*\n"
+        "{}"
+        "💎 *ИТОГО НА БИРЖАХ:* ${:.2f}\n\n"
+        "💳 *USDT кошелёк:*\n"
+        "`{}...`\n\n"
+        "━━━━━━━━━━━━━━━━\n"
+        "🤖 *Анализ Анастасии:*\n"
+        "{}"
+    ).format(
+        datetime.now().strftime('%d.%m.%Y %H:%M'),
+        stats['earn_usd'], stats['earn_rub'], stats['earn_count'],
+        stats['exp_usd'],
+        stats['profit_usd'], stats['profit_rub'],
+        wallet_lines if wallet_lines else "  Пусто\n",
+        total_balance,
+        USDT_WALLET[:25],
+        ai_summary
+    )
     await bot.send_message(chat_id=LILU_CHAT_ID, text=msg, parse_mode='Markdown')
 
 # ═══ КОМАНДЫ ═══
@@ -268,31 +262,24 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def wallets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает остатки по всем биржам"""
     global USD_RATE
     USD_RATE = await get_usd_rate()
     wallets = get_wallets()
-    
     if not wallets:
         await update.message.reply_text("🏦 Кошельки пусты — добавь первый доход через /add")
         return
-    
     total_usd = sum(w[1] for w in wallets)
     total_rub = sum(w[2] for w in wallets)
-    
-    msg = f"🏦 *ОСТАТКИ ПО БИРЖАМ*\n_Курс: 1 USD = ₽{USD_RATE:.0f}_\n\n"
-    
+    msg = "🏦 *ОСТАТКИ ПО БИРЖАМ*\n_Курс: 1 USD = ₽{:.0f}_\n\n".format(USD_RATE)
     for platform, bal_usd, bal_rub, earned, withdrawn in wallets:
         name = PLATFORMS.get(platform, platform)
         bar_pct = min(10, int(bal_usd / max(total_usd, 1) * 10))
         bar = "█" * bar_pct + "░" * (10 - bar_pct)
-        msg += f"{name}\n"
-        msg += f"  [{bar}] ${bal_usd:.2f} / ₽{bal_rub:.0f}\n"
-        msg += f"  Заработано всего: ${earned:.2f} | Выведено: ${withdrawn:.2f}\n\n"
-    
-    msg += f"━━━━━━━━━━━━━━━━\n"
-    msg += f"💎 *ИТОГО:* ${total_usd:.2f} / ₽{total_rub:.0f}"
-    
+        msg += "{}\n".format(name)
+        msg += "  [{}] ${:.2f} / ₽{:.0f}\n".format(bar, bal_usd, bal_rub)
+        msg += "  Заработано: ${:.2f} | Выведено: ${:.2f}\n\n".format(earned, withdrawn)
+    msg += "━━━━━━━━━━━━━━━━\n"
+    msg += "💎 *ИТОГО:* ${:.2f} / ₽{:.0f}".format(total_usd, total_rub)
     keyboard = [[
         InlineKeyboardButton("💸 Вывести", callback_data="withdraw_start"),
         InlineKeyboardButton("📊 Отчёт Лиле", callback_data="send_lilu")
@@ -300,26 +287,21 @@ async def wallets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Записать вывод денег с биржи"""
     keyboard = []
     wallets = get_wallets()
-    
     if not wallets:
         await update.message.reply_text("Нет активных кошельков. Сначала добавь доход через /add")
         return
-    
     for platform, bal_usd, bal_rub, _, _ in wallets:
         if bal_usd > 0:
             name = PLATFORMS.get(platform, platform)
             keyboard.append([InlineKeyboardButton(
-                f"{name} — ${bal_usd:.2f}",
-                callback_data=f"withdraw_{platform}"
+                "{} — ${:.2f}".format(name, bal_usd),
+                callback_data="withdraw_" + platform
             )])
-    
     if not keyboard:
         await update.message.reply_text("Все кошельки пусты 🤷")
         return
-    
     await update.message.reply_text(
         "💸 *Вывод денег*\n\nС какой биржи выводишь?",
         parse_mode='Markdown',
@@ -327,19 +309,16 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """История всех транзакций"""
     history = get_wallet_history()
     if not history:
         await update.message.reply_text("История пуста")
         return
-    
     msg = "📋 *ИСТОРИЯ ТРАНЗАКЦИЙ*\n\n"
     for platform, tx_type, usd, rub, desc, date in history:
         name = PLATFORMS.get(platform, platform)
         emoji = "➕" if tx_type == 'earn' else "➖"
         d = date[:10] if date else "?"
-        msg += f"{emoji} {d} | {name}\n   ${usd:.2f} — {desc[:40]}\n\n"
-    
+        msg += "{} {} | {}\n   ${:.2f} — {}\n\n".format(emoji, d, name, usd, desc[:40])
     await update.message.reply_text(msg, parse_mode='Markdown')
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -360,15 +339,22 @@ async def show_stats(update, period):
     stats = get_stats(period)
     names = {"today": "СЕГОДНЯ", "week": "НЕДЕЛЮ", "month": "МЕСЯЦ", "all": "ВСЁ ВРЕМЯ"}
     emoji = "📈" if stats['profit_usd'] >= 0 else "📉"
-    
-    msg = (f"💰 *СТАТИСТИКА ЗА {names.get(period,'МЕСЯЦ')}*\n"
-           f"_Курс: 1 USD = ₽{USD_RATE:.0f}_\n\n"
-           f"✅ Доходы: ${stats['earn_usd']:.2f} / ₽{stats['earn_rub']:.0f}\n"
-           f"❌ Расходы: ${stats['exp_usd']:.2f}\n"
-           f"{emoji} Прибыль: ${stats['profit_usd']:.2f} / ₽{stats['profit_rub']:.0f}\n"
-           f"📦 Заказов: {stats['earn_count']}\n"
-           f"🏆 Всего выплачено: ${stats['total_paid_usd']:.2f}")
-    
+    msg = (
+        "💰 *СТАТИСТИКА ЗА {}*\n"
+        "_Курс: 1 USD = ₽{:.0f}_\n\n"
+        "✅ Доходы: ${:.2f} / ₽{:.0f}\n"
+        "❌ Расходы: ${:.2f}\n"
+        "{} Прибыль: ${:.2f} / ₽{:.0f}\n"
+        "📦 Заказов: {}\n"
+        "🏆 Всего выплачено: ${:.2f}"
+    ).format(
+        names.get(period, 'МЕСЯЦ'), USD_RATE,
+        stats['earn_usd'], stats['earn_rub'],
+        stats['exp_usd'],
+        emoji, stats['profit_usd'], stats['profit_rub'],
+        stats['earn_count'],
+        stats['total_paid_usd']
+    )
     keyboard = [[
         InlineKeyboardButton("🏦 Кошельки", callback_data="show_wallets"),
         InlineKeyboardButton("📊 Лиле", callback_data="send_lilu")
@@ -384,8 +370,11 @@ async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
     for eid, desc, amt, source, date in pending:
         d = date[:10] if date else "?"
-        msg += f"• {d} — {desc[:40]} — ${amt:.2f} ({source})\n"
-        keyboard.append([InlineKeyboardButton(f"✅ Оплачен: ${amt:.2f}", callback_data=f"paid_{eid}")])
+        msg += "• {} — {} — ${:.2f} ({})\n".format(d, desc[:40], amt, source)
+        keyboard.append([InlineKeyboardButton(
+            "✅ Оплачен: ${:.2f}".format(amt),
+            callback_data="paid_{}".format(eid)
+        )])
     await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -396,14 +385,21 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def goals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats = get_stats("month")
-    targets = [("🥉 Первый доллар", 1), ("🥈 $100/месяц", 100), ("🥇 $500/месяц", 500), ("💎 $1000/месяц", 1000)]
+    targets = [
+        ("🥉 Первый доллар", 1),
+        ("🥈 $100/месяц", 100),
+        ("🥇 $500/месяц", 500),
+        ("💎 $1000/месяц", 1000)
+    ]
     msg = "🎯 *ФИНАНСОВЫЕ ЦЕЛИ*\n\n"
     for name, target in targets:
         earned = stats['earn_usd']
         pct = min(100, int(earned / target * 100))
         bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
         status = "✅" if earned >= target else "⏳"
-        msg += f"{status} *{name}*\n[{bar}] {pct}%\n${earned:.2f} / ${target}\n\n"
+        msg += "{} *{}*\n[{}] {}%\n${:.2f} / ${}\n\n".format(
+            status, name, bar, pct, earned, target
+        )
     await update.message.reply_text(msg, parse_mode='Markdown')
 
 # ═══ КНОПКИ ═══
@@ -426,7 +422,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = "🏦 *ОСТАТКИ:*\n\n"
         for platform, bal_usd, bal_rub, earned, withdrawn in wallets:
             name = PLATFORMS.get(platform, platform)
-            msg += f"{name}: ${bal_usd:.2f} / ₽{bal_rub:.0f}\n"
+            msg += "{}: ${:.2f} / ₽{:.0f}\n".format(name, bal_usd, bal_rub)
         await context.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg, parse_mode='Markdown')
 
     elif data == "withdraw_start":
@@ -435,18 +431,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for platform, bal_usd, _, _, _ in wallets:
             if bal_usd > 0:
                 name = PLATFORMS.get(platform, platform)
-                keyboard.append([InlineKeyboardButton(f"{name} — ${bal_usd:.2f}", callback_data=f"withdraw_{platform}")])
-        await query.edit_message_text("💸 С какой биржи выводишь?", reply_markup=InlineKeyboardMarkup(keyboard))
+                keyboard.append([InlineKeyboardButton(
+                    "{} — ${:.2f}".format(name, bal_usd),
+                    callback_data="withdraw_" + platform
+                )])
+        await query.edit_message_text(
+            "💸 С какой биржи выводишь?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
     elif data.startswith("withdraw_"):
         platform = data[9:]
         name = PLATFORMS.get(platform, platform)
         context.user_data['withdraw_platform'] = platform
         await query.edit_message_text(
-            f"💸 *Вывод с {name}*\n\n"
-            f"Напиши сумму в формате:\n"
-            f"`/withdraw_amount 50`  — в USD\n"
-            f"`/withdraw_amount 4500rub`  — в рублях",
+            "💸 *Вывод с {}*\n\n"
+            "Напиши сумму:\n"
+            "`/withdraw_amount 50` — в USD\n"
+            "`/withdraw_amount 4500rub` — в рублях".format(name),
             parse_mode='Markdown'
         )
 
@@ -454,45 +456,54 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mark_paid(int(data[5:]))
         await query.edit_message_text("✅ Отмечено как оплаченное!")
 
-# ═══ ОБРАБОТКА ТЕКСТОВЫХ КОМАНД ═══
+# ═══ ТЕКСТОВЫЕ КОМАНДЫ ═══
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
-    # /add 25 guru Написал статью
     if text.startswith('/add '):
         parts = text[5:].split(' ', 2)
         if len(parts) >= 2:
             try:
                 amount_str = parts[0].lower()
                 is_rub = 'rub' in amount_str
-                amount = float(amount_str.replace('rub',''))
+                amount = float(amount_str.replace('rub', ''))
                 source = parts[1] if len(parts) > 1 else "other"
                 desc = parts[2] if len(parts) > 2 else "Без описания"
                 if is_rub:
-                    add_earning(amount/USD_RATE, source, desc, amount)
-                    await update.message.reply_text(f"✅ Добавлено: ₽{amount:.0f} от {PLATFORMS.get(source, source)}")
+                    add_earning(amount / USD_RATE, source, desc, amount)
+                    await update.message.reply_text(
+                        "✅ Добавлено: ₽{:.0f} от {}".format(amount, PLATFORMS.get(source, source))
+                    )
                 else:
                     add_earning(amount, source, desc)
-                    await update.message.reply_text(f"✅ Добавлено: ${amount:.2f} от {PLATFORMS.get(source, source)}\n\nОстаток на бирже обновлён 🏦")
-            except:
-                await update.message.reply_text("❌ Формат: `/add 25 guru Описание`\n\nБиржи: guru, pph, fl, weblancer, freelance", parse_mode='Markdown')
+                    await update.message.reply_text(
+                        "✅ Добавлено: ${:.2f} от {}\n\nОстаток на бирже обновлён 🏦".format(
+                            amount, PLATFORMS.get(source, source)
+                        )
+                    )
+            except Exception:
+                await update.message.reply_text(
+                    "❌ Формат: `/add 25 guru Описание`\n\nБиржи: guru, pph, fl, weblancer, freelance",
+                    parse_mode='Markdown'
+                )
 
-    # /expense 5 Railway
     elif text.startswith('/expense '):
         parts = text[9:].split(' ', 1)
         if len(parts) >= 1:
             try:
                 amount_str = parts[0].lower()
                 is_rub = 'rub' in amount_str
-                amount = float(amount_str.replace('rub',''))
+                amount = float(amount_str.replace('rub', ''))
                 desc = parts[1] if len(parts) > 1 else "Без описания"
                 add_expense(amount, "Расход", desc, is_rub)
                 sym = "₽" if is_rub else "$"
-                await update.message.reply_text(f"✅ Расход: {sym}{amount:.2f} — {desc}")
-            except:
-                await update.message.reply_text("❌ Формат: `/expense 5 Railway`", parse_mode='Markdown')
+                await update.message.reply_text("✅ Расход: {}{:.2f} — {}".format(sym, amount, desc))
+            except Exception:
+                await update.message.reply_text(
+                    "❌ Формат: `/expense 5 Railway`",
+                    parse_mode='Markdown'
+                )
 
-    # /withdraw_amount 50 — после выбора биржи
     elif text.startswith('/withdraw_amount '):
         platform = context.user_data.get('withdraw_platform')
         if not platform:
@@ -501,47 +512,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             amount_str = text[17:].strip().lower()
             is_rub = 'rub' in amount_str
-            amount = float(amount_str.replace('rub',''))
+            amount = float(amount_str.replace('rub', ''))
             name = PLATFORMS.get(platform, platform)
+
             if is_rub:
-                update_wallet(platform, amount/USD_RATE, amount, 'withdraw', f"Вывод на карту")
+                update_wallet(platform, amount / USD_RATE, amount, 'withdraw', "Вывод на карту")
                 await update.message.reply_text(
-                    f"💸 *Вывод записан!*\n\n"
-                    f"С биржи: {name}\n"
-                    f"Сумма: ₽{amount:.0f}\n\n"
-                    f"Лила уведомлена ✅",
+                    "💸 *Вывод записан!*\n\nС биржи: {}\nСумма: ₽{:.0f}\n\nЛила уведомлена ✅".format(
+                        name, amount
+                    ),
                     parse_mode='Markdown'
+                )
+                # ИСПРАВЛЕНная строка — без вложенных кавычек
+                lilu_text = "💸 *Анастасия докладывает:*\n\nАртём вывел ₽{:.0f} с {}\n\nОстатки обновлены в базе 📊".format(
+                    amount, name
                 )
             else:
-                update_wallet(platform, amount, amount*USD_RATE, 'withdraw', f"Вывод ${amount:.2f}")
+                update_wallet(platform, amount, amount * USD_RATE, 'withdraw', "Вывод ${:.2f}".format(amount))
                 await update.message.reply_text(
-                    f"💸 *Вывод записан!*\n\n"
-                    f"С биржи: {name}\n"
-                    f"Сумма: ${amount:.2f} / ₽{amount*USD_RATE:.0f}\n\n"
-                    f"Лила уведомлена ✅",
+                    "💸 *Вывод записан!*\n\nС биржи: {}\nСумма: ${:.2f} / ₽{:.0f}\n\nЛила уведомлена ✅".format(
+                        name, amount, amount * USD_RATE
+                    ),
                     parse_mode='Markdown'
                 )
-            # Уведомляем Лилу о выводе
+                # ИСПРАВЛЕНная строка — без вложенных кавычек
+                lilu_text = "💸 *Анастасия докладывает:*\n\nАртём вывел ${:.2f} с {}\n\nОстатки обновлены в базе 📊".format(
+                    amount, name
+                )
+
             if LILU_CHAT_ID:
                 await context.bot.send_message(
                     chat_id=LILU_CHAT_ID,
-                    amount_str = f"₽{int(amount)}" if is_rub else f"${amount:.2f}"
-await context.bot.send_message(
-    chat_id=LILU_CHAT_ID,
-    text=f"💸 *Анастасия докладывает:*\n\nАртём вывел {amount_str} с {name}\n\nОстатки обновлены в базе 📊",
-    parse_mode='Markdown'
-)
+                    text=lilu_text,
                     parse_mode='Markdown'
                 )
             context.user_data.pop('withdraw_platform', None)
+
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка: {e}\n\nФормат: `/withdraw_amount 50` или `/withdraw_amount 4500rub`", parse_mode='Markdown')
+            await update.message.reply_text(
+                "❌ Ошибка: {}\n\nФормат: `/withdraw_amount 50` или `/withdraw_amount 4500rub`".format(str(e)),
+                parse_mode='Markdown'
+            )
 
 # ═══ ЕЖЕДНЕВНЫЙ ОТЧЁТ ═══
 async def daily_report(app):
     while True:
         now = datetime.now()
-        next_9 = now.replace(hour=6, minute=0, second=0, microsecond=0)  # 6 UTC = 9 MSK
+        next_9 = now.replace(hour=6, minute=0, second=0, microsecond=0)
         if now >= next_9:
             next_9 += timedelta(days=1)
         await asyncio.sleep((next_9 - now).total_seconds())
@@ -551,34 +568,45 @@ async def daily_report(app):
             stats = get_stats("today")
             wallets = get_wallets()
             total_bal = sum(w[1] for w in wallets)
-            wallet_lines = "\n".join([f"  {PLATFORMS.get(p,p)}: ${b:.2f}" for p,b,_,_,_ in wallets if b > 0])
-            msg = (f"🌅 *Доброе утро! Итоги вчера:*\n\n"
-                   f"💰 Заработано: ${stats['earn_usd']:.2f} / ₽{stats['earn_rub']:.0f}\n"
-                   f"📦 Заказов: {stats['earn_count']}\n"
-                   f"💸 Расходы: ${stats['exp_usd']:.2f}\n"
-                   f"📈 Прибыль: ${stats['profit_usd']:.2f}\n\n"
-                   f"🏦 На биржах: ${total_bal:.2f}\n{wallet_lines}")
+            wallet_lines = "\n".join([
+                "  {}: ${:.2f}".format(PLATFORMS.get(p, p), b)
+                for p, b, _, _, _ in wallets if b > 0
+            ])
+            msg = (
+                "🌅 *Доброе утро! Итоги вчера:*\n\n"
+                "💰 Заработано: ${:.2f} / ₽{:.0f}\n"
+                "📦 Заказов: {}\n"
+                "💸 Расходы: ${:.2f}\n"
+                "📈 Прибыль: ${:.2f}\n\n"
+                "🏦 На биржах: ${:.2f}\n{}"
+            ).format(
+                stats['earn_usd'], stats['earn_rub'],
+                stats['earn_count'],
+                stats['exp_usd'],
+                stats['profit_usd'],
+                total_bal, wallet_lines
+            )
             await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg, parse_mode='Markdown')
             if datetime.now().weekday() == 4:
                 stats_week = get_stats("week")
                 await send_report_to_lilu(app.bot, stats_week)
         except Exception as e:
-            logger.error(f"Ошибка дейли: {e}")
+            logger.error("Ошибка дейли: {}".format(e))
 
 def main():
     init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("today", today_command))
-    app.add_handler(CommandHandler("week", week_command))
-    app.add_handler(CommandHandler("all", all_command))
+    app.add_handler(CommandHandler("start",   start_command))
+    app.add_handler(CommandHandler("stats",   stats_command))
+    app.add_handler(CommandHandler("today",   today_command))
+    app.add_handler(CommandHandler("week",    week_command))
+    app.add_handler(CommandHandler("all",     all_command))
     app.add_handler(CommandHandler("wallets", wallets_command))
     app.add_handler(CommandHandler("withdraw", withdraw_command))
     app.add_handler(CommandHandler("history", history_command))
     app.add_handler(CommandHandler("pending", pending_command))
-    app.add_handler(CommandHandler("report", report_command))
-    app.add_handler(CommandHandler("goals", goals_command))
+    app.add_handler(CommandHandler("report",  report_command))
+    app.add_handler(CommandHandler("goals",   goals_command))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
