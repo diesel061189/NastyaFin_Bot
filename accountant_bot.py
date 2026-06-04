@@ -4,6 +4,8 @@ import logging
 import asyncio
 import sqlite3
 import httpx
+import random
+import pytz
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
@@ -24,6 +26,26 @@ USD_RATE          = 90.0
 ANTHROPIC_URL   = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_HAIKU = "claude-haiku-4-5-20251001"
 
+# ═══ GROQ — РОТАЦИЯ МОДЕЛЕЙ (НОВОЕ) ═══
+GROQ_URL    = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "gemma2-9b-it",
+    "mixtral-8x7b-32768",
+]
+_groq_model_index = 0
+
+# ═══ ВРЕМЯ МСК (НОВОЕ) ═══
+def msk_now() -> datetime:
+    return datetime.now(pytz.timezone('Europe/Moscow'))
+
+def msk_time_str() -> str:
+    return msk_now().strftime("%d.%m.%Y %H:%M МСК")
+
+def msk_hour() -> int:
+    return msk_now().hour
+
 PLATFORMS = {
     "guru":      "🟠 Guru.com",
     "pph":       "🔵 PeoplePerHour",
@@ -36,6 +58,30 @@ PLATFORMS = {
     "other":     "💼 Другое",
     "kwork":     "🟢 Kwork",
 }
+
+# ═══ GROQ С РОТАЦИЕЙ (НОВОЕ) ═══
+async def groq_request_smart(messages, max_tokens=300):
+    global _groq_model_index
+    for attempt in range(len(GROQ_MODELS)):
+        model = GROQ_MODELS[_groq_model_index]
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                r = await client.post(
+                    GROQ_URL,
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                    json={"model": model, "messages": messages, "max_tokens": max_tokens}
+                )
+                if r.status_code == 429:
+                    wait = (2 ** attempt) + random.uniform(0, 1)
+                    logger.warning(f"⚠️ Rate limit [{model}] → переключаю, жду {wait:.1f}с")
+                    _groq_model_index = (_groq_model_index + 1) % len(GROQ_MODELS)
+                    await asyncio.sleep(wait)
+                    continue
+                return r.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            _groq_model_index = (_groq_model_index + 1) % len(GROQ_MODELS)
+            await asyncio.sleep(2)
+    return "⚠️ Все модели временно недоступны."
 
 # ═══ БД ═══
 def init_db():
@@ -175,48 +221,39 @@ def get_stats(period="month"):
 # ═══ АНАЛИТИКА СИСТЕМЫ ═══
 
 def get_system_analytics(period_days: int = 7) -> dict:
-    """Собирает аналитику по всем ботам из общей БД"""
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         date_from = (datetime.now() - timedelta(days=period_days)).isoformat()
-
         c.execute('SELECT COUNT(*) FROM jobs WHERE source LIKE ? AND created_at >= ?', ('%Полифан%', date_from))
         poly_found = c.fetchone()[0]
         c.execute('SELECT COUNT(*) FROM jobs WHERE source LIKE ? AND status IN ("accepted","done","completed") AND created_at >= ?', ('%Полифан%', date_from))
         poly_taken = c.fetchone()[0]
         c.execute('SELECT COUNT(*) FROM jobs WHERE source LIKE ? AND status="done" AND created_at >= ?', ('%Полифан%', date_from))
         poly_done = c.fetchone()[0]
-
         c.execute('SELECT COUNT(*) FROM jobs WHERE source LIKE ? AND created_at >= ?', ('%Карточник%', date_from))
         card_found = c.fetchone()[0]
         c.execute('SELECT COUNT(*) FROM jobs WHERE source LIKE ? AND status IN ("accepted","done","completed") AND created_at >= ?', ('%Карточник%', date_from))
         card_taken = c.fetchone()[0]
         c.execute('SELECT COUNT(*) FROM jobs WHERE source LIKE ? AND status="done" AND created_at >= ?', ('%Карточник%', date_from))
         card_done = c.fetchone()[0]
-
         try:
             c.execute('SELECT COUNT(*) FROM filtered_jobs WHERE date >= ?', (date_from,))
             filtered_ai = c.fetchone()[0]
         except:
             filtered_ai = 0
-
         c.execute('SELECT COALESCE(SUM(amount_usd),0), COALESCE(SUM(amount_rub),0), COUNT(*) FROM earnings WHERE date >= ?', (date_from,))
         earn = c.fetchone()
         c.execute('SELECT COALESCE(SUM(amount_usd),0) FROM expenses WHERE date >= ?', (date_from,))
         exp = c.fetchone()
-
         prev_from = (datetime.now() - timedelta(days=period_days*2)).isoformat()
         c.execute('SELECT COALESCE(SUM(amount_usd),0) FROM earnings WHERE date >= ? AND date < ?', (prev_from, date_from))
         prev_earn = c.fetchone()[0]
-
         conn.close()
-
         poly_conv  = round(poly_taken / poly_found * 100) if poly_found > 0 else 0
         card_conv  = round(card_taken / card_found * 100) if card_found > 0 else 0
         earn_delta = earn[0] - prev_earn
         earn_pct   = round(earn_delta / prev_earn * 100) if prev_earn > 0 else 0
-
         return {
             'poly_found': poly_found, 'poly_taken': poly_taken,
             'poly_done': poly_done, 'poly_conv': poly_conv,
@@ -236,15 +273,13 @@ def get_system_analytics(period_days: int = 7) -> dict:
 def format_system_analytics(data: dict) -> str:
     if not data:
         return "❌ Нет данных"
-
     poly_status = "🟢" if data['poly_conv'] >= 10 else ("🟡" if data['poly_conv'] >= 5 else "🔴")
     card_status = "🟢" if data['card_conv'] >= 15 else ("🟡" if data['card_conv'] >= 8 else "🔴")
     delta_emoji = "📈" if data['earn_delta'] >= 0 else "📉"
     delta_sign  = "+" if data['earn_delta'] >= 0 else ""
-
     msg = (
         f"📊 *АНАЛИТИКА СИСТЕМЫ — {data['period_days']} дней*\n"
-        f"_{datetime.now().strftime('%d.%m.%Y %H:%M')}_\n\n"
+        f"_{msk_time_str()}_\n\n"
         f"🤖 *ПОЛИФАН*\n"
         f"├ Найдено: {data['poly_found']} заказов\n"
         f"├ Взято: {data['poly_taken']} | Закрыто: {data['poly_done']}\n"
@@ -260,7 +295,6 @@ def format_system_analytics(data: dict) -> str:
         f"├ Прибыль: ${data['profit_usd']:.2f}\n"
         f"└ {delta_emoji} К прошлому периоду: {delta_sign}{data['earn_pct']}%\n"
     )
-
     bottlenecks = []
     if data['poly_conv'] < 5:
         bottlenecks.append("⚠️ Полифан — низкая конверсия")
@@ -270,10 +304,8 @@ def format_system_analytics(data: dict) -> str:
         bottlenecks.append("🔴 Карточник не нашёл заказов!")
     if data['profit_usd'] < 0:
         bottlenecks.append("🔴 Расходы превышают доходы!")
-
     if bottlenecks:
         msg += "\n🚨 *УЗКИЕ МЕСТА:*\n" + "\n".join(bottlenecks)
-
     return msg
 
 # ═══ БАЛАНСЫ СЕРВИСОВ ═══
@@ -306,9 +338,7 @@ async def check_all_balances() -> str:
     results = await asyncio.gather(get_aidentika_balance(), get_usd_rate(), return_exceptions=True)
     aidentika = results[0] if not isinstance(results[0], Exception) else {"available": -1, "status": "error"}
     usd_rate  = results[1] if not isinstance(results[1], Exception) else 90.0
-
-    msg = "🔋 *БАЛАНСЫ СЕРВИСОВ*\n\n"
-
+    msg = f"🔋 *БАЛАНСЫ СЕРВИСОВ*\n_{msk_time_str()}_\n\n"
     if aidentika["status"] == "ok":
         sparks = aidentika["available"]
         cards_left = sparks // 8
@@ -320,26 +350,20 @@ async def check_all_balances() -> str:
         msg += "⚫ *Aidentika:* ключ не настроен\n"
     else:
         msg += "🔴 *Aidentika:* ошибка проверки\n"
-
-    msg += "\n🟢 *Groq API:* бесплатный тариф\n"
-    msg += "   └ llama-3.3-70b-versatile\n"
-
+    msg += "\n🟢 *Groq API:* ротация 4 моделей\n"
+    msg += "   └ Rate limit защита ✅\n"
     if ANTHROPIC_API_KEY:
         msg += "\n🟢 *Anthropic API:* ключ настроен\n"
-        msg += "   └ Claude Haiku + Sonnet\n"
     else:
         msg += "\n⚫ *Anthropic API:* ключ не настроен\n"
-
     msg += "\n🟢 *VPS:* 132.243.228.167 (Франкфурт)\n"
     msg += "   └ Ubuntu 24.04, 2GB/2CPU\n"
     msg += f"\n💱 *Курс USD:* ₽{usd_rate:.0f}\n"
-
     warnings = []
     if aidentika.get("available", 0) < 16 and aidentika["status"] == "ok":
         warnings.append("⚠️ Пополни Aidentika — мало искр!")
     if warnings:
         msg += "\n━━━━━━━━━━\n🚨 *ТРЕБУЕТ ВНИМАНИЯ:*\n" + "\n".join(warnings)
-
     return msg
 
 # ═══ УМНЫЙ ПАРСИНГ РАСХОДОВ ═══
@@ -360,7 +384,6 @@ async def parse_expense_natural(text: str) -> dict | None:
 "заплатил 5 долларов за домен" -> {{"amount": 5, "currency": "usd", "description": "домен", "category": "other"}}
 
 Если это НЕ расход — верни null"""
-
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.post(
                 ANTHROPIC_URL,
@@ -379,24 +402,20 @@ async def parse_expense_natural(text: str) -> dict | None:
 # ═══ АЛЕРТЫ ═══
 
 async def alerts_check(bot, chat_id: int):
-    """Проверяет и отправляет алерты если что-то не так"""
     try:
         data = get_system_analytics(1)
         alerts = []
-
         if data.get('poly_found', 0) == 0:
             alerts.append("🔴 Полифан не нашёл ни одного заказа за 24 часа!")
         if data.get('card_found', 0) == 0:
             alerts.append("🔴 Карточник не нашёл ни одного заказа за 24 часа!")
-        if data.get('earn_usd', 0) == 0 and datetime.now().hour >= 18:
+        if data.get('earn_usd', 0) == 0 and msk_hour() >= 18:
             alerts.append("⚠️ Нет дохода сегодня — стоит проверить систему")
-
         aidentika = await get_aidentika_balance()
         if aidentika.get('status') == 'ok' and aidentika.get('available', 99) < 8:
             alerts.append(f"🔴 Aidentika: осталось {aidentika['available']} искр! Пополни!")
-
         if alerts:
-            msg = "🚨 *АЛЕРТЫ АНАСТАСИИ*\n\n" + "\n".join(alerts)
+            msg = f"🚨 *АЛЕРТЫ АНАСТАСИИ*\n_{msk_time_str()}_\n\n" + "\n".join(alerts)
             await bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
             logger.info(f"⚠️ Анастасия отправила {len(alerts)} алертов")
     except Exception as e:
@@ -406,7 +425,6 @@ async def alerts_check(bot, chat_id: int):
 
 async def generate_report_ai(stats, wallets, data_system=None):
     wallet_text = "\n".join([f"{PLATFORMS.get(p, p)}: ${b:.2f}" for p, b, _, _, _ in wallets]) if wallets else "Кошельки пусты"
-
     system_info = ""
     if data_system:
         system_info = (
@@ -414,7 +432,6 @@ async def generate_report_ai(stats, wallets, data_system=None):
             f"Полифан: {data_system.get('poly_found',0)} заказов, конверсия {data_system.get('poly_conv',0)}%\n"
             f"Карточник: {data_system.get('card_found',0)} заказов, конверсия {data_system.get('card_conv',0)}%\n"
         )
-
     prompt = (
         f"Составь краткий финансовый отчёт для Лилы (генерального директора).\n\n"
         f"ДАННЫЕ:\n"
@@ -426,15 +443,10 @@ async def generate_report_ai(stats, wallets, data_system=None):
         f"{system_info}\n"
         f"Напиши отчёт 3-4 предложения. Деловой тон. Что хорошо и что улучшить."
     )
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={"model": "llama-3.3-70b-versatile",
-                  "messages": [{"role": "user", "content": prompt}],
-                  "max_tokens": 300}
-        )
-        return r.json()["choices"][0]["message"]["content"].strip()
+    return await groq_request_smart(
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=300
+    )
 
 async def send_report_to_lilu(bot, stats):
     if not LILU_CHAT_ID:
@@ -442,15 +454,12 @@ async def send_report_to_lilu(bot, stats):
     wallets      = get_wallets()
     data_system  = get_system_analytics(7)
     ai_summary   = await generate_report_ai(stats, wallets, data_system)
-
     wallet_lines = ""
     total_balance = 0
     for platform, bal_usd, bal_rub, earned, withdrawn in wallets:
         name = PLATFORMS.get(platform, platform)
         wallet_lines += f"├ {name}: ${bal_usd:.2f} / ₽{bal_rub:.0f}\n"
         total_balance += bal_usd
-
-    # Аналитика системы для Лилы
     system_block = ""
     if data_system:
         system_block = (
@@ -459,10 +468,9 @@ async def send_report_to_lilu(bot, stats):
             f"├ Полифан: {data_system['poly_found']} найдено, конверсия {data_system['poly_conv']}%\n"
             f"└ Карточник: {data_system['card_found']} найдено, конверсия {data_system['card_conv']}%\n"
         )
-
     msg = (
         f"📊 *ФИНАНСОВЫЙ ОТЧЁТ — АНАСТАСИЯ*\n"
-        f"_{datetime.now().strftime('%d.%m.%Y %H:%M')}_\n\n"
+        f"_{msk_time_str()}_\n\n"
         f"━━━━━━━━━━━━━━━━\n"
         f"💰 *ДОХОДЫ (месяц)*\n"
         f"├ USD: ${stats['earn_usd']:.2f}\n"
@@ -483,22 +491,18 @@ async def send_report_to_lilu(bot, stats):
     await bot.send_message(chat_id=LILU_CHAT_ID, text=msg, parse_mode='Markdown')
 
 async def weekly_system_report(bot, chat_id: int):
-    """Полный еженедельный отчёт по системе"""
     data    = get_system_analytics(7)
     stats   = get_stats("week")
     wallets = get_wallets()
-
     system_msg  = format_system_analytics(data)
     ai_summary  = await generate_report_ai(stats, wallets, data)
-
     wallet_lines = "\n".join([
         f"  {PLATFORMS.get(p, p)}: ${b:.2f}"
         for p, b, _, _, _ in wallets if b > 0
     ]) or "  Кошельки пусты"
-
     full_msg = (
         f"📊 *ЕЖЕНЕДЕЛЬНЫЙ ОТЧЁТ*\n"
-        f"_{datetime.now().strftime('%d.%m.%Y')}_\n\n"
+        f"_{msk_time_str()}_\n\n"
         f"{system_msg}\n"
         f"━━━━━━━━━━━━━━━━\n"
         f"🏦 *На биржах:*\n{wallet_lines}\n\n"
@@ -512,27 +516,28 @@ async def weekly_system_report(bot, chat_id: int):
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "💰 *Анастасия — Финансовый аналитик*\n\n"
-        "Слежу за деньгами и аналитикой системы!\n\n"
-        "/stats — статистика за месяц\n"
-        "/system — аналитика всей системы\n"
-        "/forecast — прогноз дохода\n"
-        "/wallets — остатки по биржам\n"
-        "/balances — балансы всех сервисов\n"
-        "/withdraw — записать вывод денег\n"
-        "/add — добавить доход\n"
-        "/expense — добавить расход\n"
-        "/pending — ожидают оплаты\n"
-        "/report — отчёт Лиле\n"
-        "/goals — финансовые цели\n"
-        "/history — история транзакций\n\n"
-        "💬 *Или напиши обычным текстом:*\n"
-        "_«потратил 390р на айдентику»_",
+        f"💰 *Анастасия v2.1 — Финансовый аналитик*\n\n"
+        f"🕐 {msk_time_str()}\n\n"
+        f"Слежу за деньгами и аналитикой системы!\n"
+        f"⚡ Groq: ротация 4 моделей — работаю без остановок\n\n"
+        f"/stats — статистика за месяц\n"
+        f"/system — аналитика всей системы\n"
+        f"/forecast — прогноз дохода\n"
+        f"/wallets — остатки по биржам\n"
+        f"/balances — балансы всех сервисов\n"
+        f"/withdraw — записать вывод денег\n"
+        f"/add — добавить доход\n"
+        f"/expense — добавить расход\n"
+        f"/pending — ожидают оплаты\n"
+        f"/report — отчёт Лиле\n"
+        f"/goals — финансовые цели\n"
+        f"/history — история транзакций\n\n"
+        f"💬 *Или напиши обычным текстом:*\n"
+        f"_«потратил 390р на айдентику»_",
         parse_mode='Markdown'
     )
 
 async def system_analytics_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Аналитика всей системы"""
     args = context.args
     days = 7
     if args:
@@ -540,31 +545,22 @@ async def system_analytics_command(update: Update, context: ContextTypes.DEFAULT
             days = int(args[0])
         except:
             pass
-
     await update.message.reply_text(f"📊 Собираю аналитику за {days} дней...")
     data = get_system_analytics(days)
     msg  = format_system_analytics(data)
-
-    # AI анализ
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                json={"model": "llama-3.3-70b-versatile",
-                      "messages": [{"role": "user", "content":
-                          f"Ты Анастасия — финансовый аналитик. Дай краткий анализ за {days} дней:\n"
-                          f"Полифан: {data.get('poly_found',0)} заказов, конверсия {data.get('poly_conv',0)}%\n"
-                          f"Карточник: {data.get('card_found',0)} заказов, конверсия {data.get('card_conv',0)}%\n"
-                          f"Доход: ${data.get('earn_usd',0):.2f}, прибыль: ${data.get('profit_usd',0):.2f}\n"
-                          f"3 предложения: что хорошо, где проблема, рекомендация."}],
-                      "max_tokens": 200}
-            )
-            summary = r.json()["choices"][0]["message"]["content"].strip()
+        summary = await groq_request_smart(
+            messages=[{"role": "user", "content":
+                f"Ты Анастасия — финансовый аналитик. Дай краткий анализ за {days} дней:\n"
+                f"Полифан: {data.get('poly_found',0)} заказов, конверсия {data.get('poly_conv',0)}%\n"
+                f"Карточник: {data.get('card_found',0)} заказов, конверсия {data.get('card_conv',0)}%\n"
+                f"Доход: ${data.get('earn_usd',0):.2f}, прибыль: ${data.get('profit_usd',0):.2f}\n"
+                f"3 предложения: что хорошо, где проблема, рекомендация."}],
+            max_tokens=200
+        )
         msg += f"\n\n🤖 *Анализ:*\n_{summary}_"
     except:
         pass
-
     keyboard = [[
         InlineKeyboardButton("📅 7 дней",  callback_data="analytics_7"),
         InlineKeyboardButton("📅 30 дней", callback_data="analytics_30"),
@@ -573,18 +569,15 @@ async def system_analytics_command(update: Update, context: ContextTypes.DEFAULT
     await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def forecast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Прогноз дохода"""
     stats      = get_stats("month")
     data_7     = get_system_analytics(7)
-    days_passed = datetime.now().day
-
+    days_passed = msk_now().day
     daily_rate  = stats['earn_usd'] / days_passed if days_passed > 0 else 0
     forecast    = daily_rate * 30
     weekly_proj = data_7.get('earn_usd', 0) * 4
     remaining   = max(0, 100 - stats['earn_usd'])
-
     msg = (
-        f"🔮 *ПРОГНОЗ ДОХОДА*\n\n"
+        f"🔮 *ПРОГНОЗ ДОХОДА*\n_{msk_time_str()}_\n\n"
         f"📅 *Текущий месяц:*\n"
         f"├ Прошло дней: {days_passed}\n"
         f"├ Заработано: ${stats['earn_usd']:.2f}\n"
@@ -594,13 +587,11 @@ async def forecast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"└ Проекция x4: *${weekly_proj:.2f}*\n\n"
         f"🎯 *До цели $100/мес:* "
     )
-
     if remaining == 0:
         msg += "✅ *ДОСТИГНУТА!*"
     else:
         days_left = round(remaining / daily_rate) if daily_rate > 0 else 999
         msg += f"осталось ${remaining:.2f} (~{days_left} дней)"
-
     await update.message.reply_text(msg, parse_mode='Markdown')
 
 async def balances_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -618,7 +609,7 @@ async def wallets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     total_usd = sum(w[1] for w in wallets)
     total_rub = sum(w[2] for w in wallets)
-    msg = f"🏦 *ОСТАТКИ ПО БИРЖАМ*\n_Курс: 1 USD = ₽{USD_RATE:.0f}_\n\n"
+    msg = f"🏦 *ОСТАТКИ ПО БИРЖАМ*\n_{msk_time_str()}_\n_Курс: 1 USD = ₽{USD_RATE:.0f}_\n\n"
     for platform, bal_usd, bal_rub, earned, withdrawn in wallets:
         name    = PLATFORMS.get(platform, platform)
         bar_pct = min(10, int(bal_usd / max(total_usd, 1) * 10))
@@ -654,7 +645,7 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not history:
         await update.message.reply_text("История пуста")
         return
-    msg = "📋 *ИСТОРИЯ ТРАНЗАКЦИЙ*\n\n"
+    msg = f"📋 *ИСТОРИЯ ТРАНЗАКЦИЙ*\n_{msk_time_str()}_\n\n"
     for platform, tx_type, usd, rub, desc, date in history:
         name  = PLATFORMS.get(platform, platform)
         emoji = "➕" if tx_type == 'earn' else "➖"
@@ -676,6 +667,7 @@ async def show_stats(update, period):
     emoji = "📈" if stats['profit_usd'] >= 0 else "📉"
     msg = (
         f"💰 *СТАТИСТИКА ЗА {names.get(period, 'МЕСЯЦ')}*\n"
+        f"_{msk_time_str()}_\n"
         f"_Курс: 1 USD = ₽{USD_RATE:.0f}_\n\n"
         f"✅ Доходы: ${stats['earn_usd']:.2f} / ₽{stats['earn_rub']:.0f}\n"
         f"❌ Расходы: ${stats['exp_usd']:.2f} / ₽{stats['exp_rub']:.0f}\n"
@@ -713,7 +705,7 @@ async def goals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats   = get_stats("month")
     targets = [("🥉 Первый доллар", 1), ("🥈 $100/месяц", 100),
                ("🥇 $500/месяц", 500), ("💎 $1000/месяц", 1000)]
-    msg = "🎯 *ФИНАНСОВЫЕ ЦЕЛИ*\n\n"
+    msg = f"🎯 *ФИНАНСОВЫЕ ЦЕЛИ*\n_{msk_time_str()}_\n\n"
     for name, target in targets:
         earned = stats['earn_usd']
         pct    = min(100, int(earned / target * 100))
@@ -734,7 +726,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_report_to_lilu(context.application.bot, stats)
         await query.edit_message_reply_markup(None)
         await context.bot.send_message(chat_id=YOUR_CHAT_ID, text="✅ Отчёт отправлен Лиле!")
-
     elif data == "show_wallets":
         wallets = get_wallets()
         if not wallets:
@@ -745,13 +736,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             name  = PLATFORMS.get(platform, platform)
             msg  += f"{name}: ${bal_usd:.2f} / ₽{bal_rub:.0f}\n"
         await context.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg, parse_mode='Markdown')
-
     elif data == "refresh_balances":
         await query.edit_message_text("🔄 Проверяю балансы...")
         msg = await check_all_balances()
         keyboard = [[InlineKeyboardButton("🔄 Обновить", callback_data="refresh_balances")]]
         await query.edit_message_text(msg, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
-
     elif data == "analytics_7":
         d   = get_system_analytics(7)
         msg = format_system_analytics(d)
@@ -760,7 +749,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("📊 Лиле",    callback_data="analytics_lilu"),
         ]]
         await query.edit_message_text(msg, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
-
     elif data == "analytics_30":
         d   = get_system_analytics(30)
         msg = format_system_analytics(d)
@@ -769,12 +757,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("📊 Лиле",   callback_data="analytics_lilu"),
         ]]
         await query.edit_message_text(msg, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
-
     elif data == "analytics_lilu":
         stats = get_stats("week")
         await send_report_to_lilu(context.application.bot, stats)
         await query.answer("Отчёт отправлен Лиле!")
-
     elif data == "withdraw_start":
         wallets  = get_wallets()
         keyboard = []
@@ -783,7 +769,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 name = PLATFORMS.get(platform, platform)
                 keyboard.append([InlineKeyboardButton(f"{name} — ${bal_usd:.2f}", callback_data=f"withdraw_{platform}")])
         await query.edit_message_text("💸 С какой биржи?", reply_markup=InlineKeyboardMarkup(keyboard))
-
     elif data.startswith("withdraw_"):
         platform = data[9:]
         name     = PLATFORMS.get(platform, platform)
@@ -794,7 +779,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"`/withdraw_amount 4500rub` — в рублях",
             parse_mode='Markdown'
         )
-
     elif data.startswith("paid_"):
         mark_paid(int(data[5:]))
         await query.edit_message_text("✅ Отмечено как оплаченное!")
@@ -879,21 +863,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await update.message.reply_text(
-                "Привет! Я Анастасия 💰\n\n"
-                "Команды: /stats /system /forecast /wallets /balances\n\n"
-                "Или напиши: _«потратил 390р на айдентику»_",
+                f"Привет! Я Анастасия 💰\n"
+                f"_{msk_time_str()}_\n\n"
+                f"Команды: /stats /system /forecast /wallets /balances\n\n"
+                f"Или напиши: _«потратил 390р на айдентику»_",
                 parse_mode='Markdown'
             )
 
-# ═══ ЕЖЕДНЕВНЫЙ ОТЧЁТ ═══
+# ═══ ЕЖЕДНЕВНЫЙ ОТЧЁТ — МСК (ОБНОВЛЕНО) ═══
 
 async def daily_report(app):
     while True:
-        now    = datetime.now()
-        next_6 = now.replace(hour=6, minute=0, second=0, microsecond=0)
-        if now >= next_6:
-            next_6 += timedelta(days=1)
-        await asyncio.sleep((next_6 - now).total_seconds())
+        now     = msk_now()
+        next_9  = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        if now >= next_9:
+            next_9 = next_9 + timedelta(days=1)
+        await asyncio.sleep((next_9 - now).total_seconds())
         try:
             global USD_RATE
             USD_RATE = await get_usd_rate()
@@ -911,7 +896,8 @@ async def daily_report(app):
                 for p, b, _, _, _ in wallets if b > 0
             ])
             msg = (
-                f"🌅 *Доброе утро! Итоги вчера:*\n\n"
+                f"🌅 *Доброе утро! Итоги вчера:*\n"
+                f"_{msk_time_str()}_\n\n"
                 f"💰 Заработано: ${stats['earn_usd']:.2f} / ₽{stats['earn_rub']:.0f}\n"
                 f"📦 Заказов: {stats['earn_count']}\n"
                 f"💸 Расходы: ${stats['exp_usd']:.2f}\n"
@@ -920,12 +906,10 @@ async def daily_report(app):
                 f"{balance_warn}"
             )
             await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg, parse_mode='Markdown')
-
-            # Проверяем алерты
             await alerts_check(app.bot, YOUR_CHAT_ID)
 
-            # По воскресеньям — полный отчёт системы
-            if datetime.now().weekday() == 6:
+            # По воскресеньям — полный отчёт
+            if msk_now().weekday() == 6:
                 await weekly_system_report(app.bot, YOUR_CHAT_ID)
 
         except Exception as e:
@@ -959,15 +943,14 @@ def main():
                 await application.bot.send_message(
                     chat_id=YOUR_CHAT_ID,
                     text=(
-                        "💰 *Анастасия v2.0 запущена!*\n\n"
-                        "📊 Теперь я финансовый аналитик!\n"
-                        "✅ Слежу за деньгами и системой\n"
-                        "⏰ Утренний отчёт в 9:00 МСК\n"
-                        "🚨 Алерты если что-то не так\n"
-                        "📅 Еженедельный отчёт по воскресеньям\n\n"
-                        "Новые команды:\n"
-                        "/system — аналитика всей системы\n"
-                        "/forecast — прогноз дохода"
+                        f"💰 *Анастасия v2.1 запущена!*\n\n"
+                        f"🕐 {msk_time_str()}\n\n"
+                        f"✅ Groq — ротация 4 моделей\n"
+                        f"✅ Rate limit защита\n"
+                        f"✅ Время МСК везде\n"
+                        f"✅ Отчёт в 9:00 МСК (было 6:00 UTC)\n"
+                        f"✅ Алерты если что-то не так\n\n"
+                        f"/system /forecast /wallets"
                     ),
                     parse_mode='Markdown'
                 )
@@ -975,7 +958,7 @@ def main():
             logger.error(f"post_init: {e}")
 
     app.post_init = post_init
-    logger.info("💰 Анастасия v2.0 запущена!")
+    logger.info("💰 Анастасия v2.1 запущена!")
     app.run_polling()
 
 if __name__ == "__main__":
