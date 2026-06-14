@@ -3,24 +3,6 @@
 НАСТЯ — МОЗГ УЧЁТА (nastya_brain.py)
 =====================================
 Самодостаточный модуль. Считает реальную картину по живой базе.
-
-ПОЧЕМУ ОТДЕЛЬНЫЙ ФАЙЛ:
-  Старая Настя считала из пустой таблицы `earnings` -> вечные нули.
-  А реальные заказы лежат в ДВУХ таблицах:
-     • jobs   (311) — Полифан + Карточник   (created_at в ISO: 2026-06-13T13:59:03.096329)
-     • orders (55)  — Охотник/Workzilla + часть FL.ru (created_at: 2026-06-13 13:59:04)
-  Плюс каша в поле source: "Полифан | FL.ru", "Карточник | WWR", и просто "FL.ru" без бота.
-
-ЭТОТ МОДУЛЬ:
-  - читает ОБЕ таблицы, парсит оба формата времени,
-  - нормализует source (схлопывает кашу),
-  - строит отчёт: активность 24ч по источникам, воронка, молчуны,
-  - деньги (earnings) + оборот за 12 мес + % до потолка НПД 2.4 млн,
-  - log_event() — общий приёмник для других ботов на будущее,
-  - record_income() — ручная фиксация реального дохода.
-
-ЗАПУСК ДЛЯ ПРОВЕРКИ (НИЧЕГО НЕ ЛОМАЕТ, только читает и печатает):
-    cd /opt/bots/NastyaFin_Bot && python3 nastya_brain.py
 """
 
 import os
@@ -30,19 +12,11 @@ from datetime import datetime, timedelta
 
 # ─────────────────────────── КОНФИГ ───────────────────────────
 DB_PATH       = os.getenv("DB_PATH", "/opt/bots/data/freelance.db")
-NPD_CEILING   = 2_400_000          # потолок самозанятого, руб/год (скользящие 12 мес)
-USD_RATE      = float(os.getenv("USD_RATE", "80"))  # грубый курс для пересчёта (уточним позже)
-SILENCE_HOURS = 24                 # сколько часов молчания = тревога
+NPD_CEILING   = 2_400_000
+USD_RATE      = float(os.getenv("USD_RATE", "80"))
+SILENCE_HOURS = 24
 
-# Какие боты МЫ ОЖИДАЕМ увидеть. Если кого-то нет за сутки — он попадёт в "молчуны".
 EXPECTED_BOTS = ["Полифан", "Карточник", "Охотник"]
-
-# Карта атрибуции источника -> бот.
-# Прим.: source — это каша. Бот определяем так:
-#   1) если в строке явно есть имя бота (до "|") — берём его;
-#   2) записи в таблице `orders` без явного бота относим к Охотнику (его домен — Workzilla);
-#   3) записи в `jobs` без префикса относим к Полифану (он с ~6 июня пишет без имени).
-# Если атрибуция где-то промахнётся — поправим этот блок, когда увидишь реальный вывод.
 
 
 # ─────────────────────────── БАЗА ───────────────────────────
@@ -61,11 +35,10 @@ def _table_cols(c, table):
 
 # ─────────────────────────── ВРЕМЯ ───────────────────────────
 def parse_ts(s):
-    """Понимает оба формата: '2026-06-13T13:59:03.096329' и '2026-06-13 13:59:04'."""
     if not s:
         return None
     s = str(s).strip().replace("T", " ")
-    s = s.split("+")[0].strip()            # отрезаем таймзону если вдруг есть
+    s = s.split("+")[0].strip()
     for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
         try:
             return datetime.strptime(s, fmt)
@@ -76,20 +49,18 @@ def parse_ts(s):
 
 # ─────────────────────────── ДЕНЬГИ ИЗ ТЕКСТА ───────────────────────────
 def money_from_text(s):
-    """'5000 руб' -> 5000, 'от 1000' -> 1000, 'договорная' -> 0, '1000-5000' -> 1000."""
     if s is None:
         return 0
     if isinstance(s, (int, float)):
         return int(s)
     nums = re.findall(r"\d[\d \u00a0]*", str(s))
     nums = [int(re.sub(r"[ \u00a0]", "", n)) for n in nums if re.sub(r"[ \u00a0]", "", n)]
-    nums = [n for n in nums if n >= 100]   # отсекаем мусорные мелкие числа
+    nums = [n for n in nums if n >= 100]
     return nums[0] if nums else 0
 
 
 # ─────────────────────────── НОРМАЛИЗАЦИЯ ИСТОЧНИКА ───────────────────────────
 def normalize(source, table):
-    """Возвращает (бот, биржа) из кашеобразного source."""
     raw = (source or "").strip()
     bot, exch = None, raw
 
@@ -106,20 +77,17 @@ def normalize(source, table):
             bot = prefix or None
 
     if bot is None:
-        # нет явного имени бота
         if table == "orders":
-            bot = "Охотник"      # домен orders — Workzilla/Охотник
+            bot = "Охотник"
         else:
-            bot = "Полифан"      # jobs без префикса — Полифан (сменил формат ~6 июня)
+            bot = "Полифан"
 
-    # чистим биржу от лишних пробелов/смайлов для группировки (смайлы оставляем для вида)
     exch = exch.strip() or "—"
     return bot, exch
 
 
 # ─────────────────────────── СБОР СТРОК ───────────────────────────
 def _pull(c, table, since):
-    """Тянем все строки таблицы и фильтруем по времени в Python (форматы разные)."""
     cols = _table_cols(c, table)
     if not cols or "created_at" not in cols:
         return []
@@ -177,7 +145,7 @@ def funnel(hours=24):
             f["сдано"] += 1
         elif st in ("accepted", "отклик", "принято", "in_progress"):
             f["отклик/принято"] += 1
-        else:                       # found / new / '' / прочее
+        else:
             f["найдено"] += 1
     return f
 
@@ -188,16 +156,16 @@ def silent_bots(hours=SILENCE_HOURS):
 
 
 def money(hours=24):
-    """Реальный доход/расход из earnings/expenses + оборот 12 мес + % до потолка."""
     out = {"earn_rub": 0, "earn_cnt": 0, "exp_rub": 0,
            "turnover_12m": 0, "ceiling_pct": 0.0, "ceiling_alert": None}
     since = datetime.now() - timedelta(hours=hours)
     y12   = datetime.now() - timedelta(days=365)
     with _conn() as c:
         ecols = _table_cols(c, "earnings")
-        if "amount_rub" in ecols and "created_at" in ecols:
-            for r in c.execute("SELECT amount_rub, created_at FROM earnings"):
-                ts = parse_ts(r["created_at"])
+        edate = "created_at" if "created_at" in ecols else ("date" if "date" in ecols else None)
+        if "amount_rub" in ecols and edate:
+            for r in c.execute(f"SELECT amount_rub, {edate} AS d FROM earnings"):
+                ts = parse_ts(r["d"])
                 if ts is None:
                     continue
                 amt = r["amount_rub"] or 0
@@ -234,8 +202,6 @@ def _ensure_events(c):
 
 
 def log_event(project, kind, amount_rub=0, meta=""):
-    """Общий приёмник. Другие боты будут звать его при действии:
-       log_event('Карточник', 'card_done', 0) / log_event('фриланс', 'income', 15000)."""
     with _conn() as c:
         _ensure_events(c)
         c.execute("INSERT INTO events(project,kind,amount_rub,meta,created_at) VALUES(?,?,?,?,?)",
@@ -244,7 +210,6 @@ def log_event(project, kind, amount_rub=0, meta=""):
 
 
 def record_income(amount_rub, description="", source="manual"):
-    """Ручная фиксация РЕАЛЬНОГО дохода -> пишет в earnings (динамически, под любую схему)."""
     now = datetime.now().isoformat()
     payload = {
         "amount_rub": int(amount_rub),
@@ -253,6 +218,7 @@ def record_income(amount_rub, description="", source="manual"):
         "source": source,
         "status": "received",
         "created_at": now,
+        "date": now,
     }
     with _conn() as c:
         cols = _table_cols(c, "earnings")
@@ -277,7 +243,6 @@ def build_report(hours=24):
     L.append(f"🌅 *НАСТЯ — ИТОГИ ЗА {hours}ч*")
     L.append(f"_{datetime.now():%d.%m.%Y %H:%M}_\n")
 
-    # 1. боты
     L.append("🤖 *Кто сколько нашёл:*")
     if a["by_bot"]:
         for bot, d in sorted(a["by_bot"].items(), key=lambda x: -x[1]["count"]):
@@ -286,28 +251,23 @@ def build_report(hours=24):
     else:
         L.append("  • тишина — никто ничего не принёс")
 
-    # 2. молчуны
     if silent:
         L.append("\n⚠️ *Молчат " + str(hours) + "ч:* " + ", ".join(silent))
         if "Охотник" in silent:
             L.append("  └ Охотник = Tampermonkey в браузере; молчит когда браузер закрыт")
 
-    # 3. источники
     if a["by_exch"]:
         L.append("\n📡 *По биржам:*")
         for exch, cnt in sorted(a["by_exch"].items(), key=lambda x: -x[1]):
             L.append(f"  • {exch}: {cnt}")
 
-    # 4. воронка
     L.append("\n🔻 *Воронка:*")
     L.append(f"  найдено {f['найдено']} → отклик/принято {f['отклик/принято']} → сдано {f['сдано']}")
 
-    # 5. потенциал
     L.append(f"\n💼 *Найдено всего:* {a['total']} заказов")
     if a["money"]:
         L.append(f"   потенциал бюджетов: ~{a['money']:,}₽".replace(",", " ") + " _(запрошено клиентами, не доход)_")
 
-    # 6. деньги
     L.append("\n💰 *Реальные деньги:*")
     L.append(f"  доход: {m['earn_rub']:,}₽ ({m['earn_cnt']} шт)".replace(",", " "))
     L.append(f"  расход: {m['exp_rub']:,}₽".replace(",", " "))
@@ -315,7 +275,6 @@ def build_report(hours=24):
     if m["earn_rub"] == 0:
         L.append("  _(ноль — пока не фиксируешь оплаты. Команда: /income 15000 заказ Х)_")
 
-    # 7. потолок НПД
     L.append("\n🏛 *Потолок самозанятого (2.4 млн / 12 мес):*")
     L.append(f"  оборот за год: {m['turnover_12m']:,}₽ = {m['ceiling_pct']}%".replace(",", " "))
     if m["ceiling_alert"]:
@@ -324,14 +283,5 @@ def build_report(hours=24):
     return "\n".join(L)
 
 
-# ─────────────────────────── ЗАПУСК ДЛЯ ПРОВЕРКИ ───────────────────────────
 if __name__ == "__main__":
-    print("\n" + "=" * 48)
-    print("ПРОВЕРКА НАСТИ НА ЖИВОЙ БАЗЕ (только чтение)")
-    print("DB:", DB_PATH)
-    print("=" * 48 + "\n")
-    # markdown-звёздочки в консоли просто игнорируй — в телеге они станут жирным
     print(build_report(24))
-    print("\n" + "=" * 48)
-    print("Если цифры похожи на правду — вшиваем в accountant_bot.py.")
-    print("=" * 48)
