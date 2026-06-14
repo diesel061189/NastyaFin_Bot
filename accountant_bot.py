@@ -6,6 +6,8 @@ import sqlite3
 import httpx
 import random
 import pytz
+import re
+import nastya_brain  # мозг учёта (живая БД jobs+orders, потолок НПД)
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
@@ -18,7 +20,7 @@ GROQ_API_KEY      = os.getenv("GROQ_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 YOUR_CHAT_ID      = int(os.getenv("YOUR_CHAT_ID", "0"))
 LILU_CHAT_ID      = int(os.getenv("LILU_CHAT_ID", "0"))
-DB_PATH           = os.getenv("DB_PATH", "/tmp/freelance.db")
+DB_PATH           = os.getenv("DB_PATH", "/opt/bots/data/freelance.db")
 USDT_WALLET       = os.getenv("USDT_WALLET", "TECM5HuPvi9Z6RNzbHZLtesSkKwHBLJEJc")
 AIDENTIKA_API_KEY = os.getenv("AIDENTIKA_API_KEY", "")
 USD_RATE          = 90.0
@@ -26,7 +28,6 @@ USD_RATE          = 90.0
 ANTHROPIC_URL   = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_HAIKU = "claude-haiku-4-5-20251001"
 
-# ═══ GROQ — РОТАЦИЯ МОДЕЛЕЙ (НОВОЕ) ═══
 GROQ_URL    = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODELS = [
     "llama-3.3-70b-versatile",
@@ -36,7 +37,6 @@ GROQ_MODELS = [
 ]
 _groq_model_index = 0
 
-# ═══ ВРЕМЯ МСК (НОВОЕ) ═══
 def msk_now() -> datetime:
     return datetime.now(pytz.timezone('Europe/Moscow'))
 
@@ -59,7 +59,6 @@ PLATFORMS = {
     "kwork":     "🟢 Kwork",
 }
 
-# ═══ GROQ С РОТАЦИЕЙ (НОВОЕ) ═══
 async def groq_request_smart(messages, max_tokens=300):
     global _groq_model_index
     for attempt in range(len(GROQ_MODELS)):
@@ -83,7 +82,6 @@ async def groq_request_smart(messages, max_tokens=300):
             await asyncio.sleep(2)
     return "⚠️ Все модели временно недоступны."
 
-# ═══ БД ═══
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -218,8 +216,6 @@ def get_stats(period="month"):
         'total_paid_usd': total_paid[0], 'total_paid_count': total_paid[1]
     }
 
-# ═══ АНАЛИТИКА СИСТЕМЫ ═══
-
 def get_system_analytics(period_days: int = 7) -> dict:
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -308,8 +304,6 @@ def format_system_analytics(data: dict) -> str:
         msg += "\n🚨 *УЗКИЕ МЕСТА:*\n" + "\n".join(bottlenecks)
     return msg
 
-# ═══ БАЛАНСЫ СЕРВИСОВ ═══
-
 async def get_usd_rate():
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -366,8 +360,6 @@ async def check_all_balances() -> str:
         msg += "\n━━━━━━━━━━\n🚨 *ТРЕБУЕТ ВНИМАНИЯ:*\n" + "\n".join(warnings)
     return msg
 
-# ═══ УМНЫЙ ПАРСИНГ РАСХОДОВ ═══
-
 async def parse_expense_natural(text: str) -> dict | None:
     if not ANTHROPIC_API_KEY:
         return None
@@ -399,8 +391,6 @@ async def parse_expense_natural(text: str) -> dict | None:
         logger.error(f"parse_expense_natural error: {e}")
         return None
 
-# ═══ АЛЕРТЫ ═══
-
 async def alerts_check(bot, chat_id: int):
     try:
         data = get_system_analytics(1)
@@ -420,8 +410,6 @@ async def alerts_check(bot, chat_id: int):
             logger.info(f"⚠️ Анастасия отправила {len(alerts)} алертов")
     except Exception as e:
         logger.error(f"alerts_check: {e}")
-
-# ═══ ОТЧЁТЫ ═══
 
 async def generate_report_ai(stats, wallets, data_system=None):
     wallet_text = "\n".join([f"{PLATFORMS.get(p, p)}: ${b:.2f}" for p, b, _, _, _ in wallets]) if wallets else "Кошельки пусты"
@@ -512,8 +500,6 @@ async def weekly_system_report(bot, chat_id: int):
     if LILU_CHAT_ID and LILU_CHAT_ID != chat_id:
         await bot.send_message(chat_id=LILU_CHAT_ID, text=full_msg, parse_mode='Markdown')
 
-# ═══ КОМАНДЫ ═══
-
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"💰 *Анастасия v2.1 — Финансовый аналитик*\n\n"
@@ -531,7 +517,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/pending — ожидают оплаты\n"
         f"/report — отчёт Лиле\n"
         f"/goals — финансовые цели\n"
-        f"/history — история транзакций\n\n"
+        f"/history — история транзакций\n"
+        f"/brain — точный отчёт по живой базе\n"
+        f"/income — записать реальный доход (потолок НПД)\n\n"
         f"💬 *Или напиши обычным текстом:*\n"
         f"_«потратил 390р на айдентику»_",
         parse_mode='Markdown'
@@ -714,8 +702,6 @@ async def goals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg   += f"{status} *{name}*\n[{bar}] {pct}%\n${earned:.2f} / ${target}\n\n"
     await update.message.reply_text(msg, parse_mode='Markdown')
 
-# ═══ КНОПКИ ═══
-
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -782,8 +768,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("paid_"):
         mark_paid(int(data[5:]))
         await query.edit_message_text("✅ Отмечено как оплаченное!")
-
-# ═══ ОБРАБОТКА СООБЩЕНИЙ ═══
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
@@ -870,8 +854,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode='Markdown'
             )
 
-# ═══ ЕЖЕДНЕВНЫЙ ОТЧЁТ — МСК (ОБНОВЛЕНО) ═══
-
 async def daily_report(app):
     while True:
         now     = msk_now()
@@ -906,14 +888,89 @@ async def daily_report(app):
                 f"{balance_warn}"
             )
             await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg, parse_mode='Markdown')
+
+            # ── точный отчёт из мозга: кто нашёл, воронка, потолок НПД (живая БД) ──
+            try:
+                await app.bot.send_message(
+                    chat_id=YOUR_CHAT_ID,
+                    text=nastya_brain.build_report(24),
+                    parse_mode='Markdown'
+                )
+            except Exception as e:
+                logger.error(f"brain report ошибка: {e}")
+
             await alerts_check(app.bot, YOUR_CHAT_ID)
 
-            # По воскресеньям — полный отчёт
             if msk_now().weekday() == 6:
                 await weekly_system_report(app.bot, YOUR_CHAT_ID)
 
         except Exception as e:
             logger.error(f"daily_report ошибка: {e}")
+
+# ═══ МОЗГ: ТОЧНЫЙ ОТЧЁТ + ФИКСАЦИЯ ДОХОДА ═══
+
+async def brain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Точный отчёт по живой базе (jobs+orders): кто нашёл, воронка, потолок НПД.
+       /brain  или  /brain 48  (часы)"""
+    hours = 24
+    if context.args:
+        try:
+            hours = int(context.args[0])
+        except ValueError:
+            pass
+    try:
+        await update.message.reply_text(
+            nastya_brain.build_report(hours), parse_mode='Markdown'
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Мозг споткнулся: {e}")
+
+
+async def income_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Фиксация РЕАЛЬНОГО дохода (рубли) -> копит оборот для потолка НПД 2.4 млн.
+       Формат: /income 15000 описание заказа"""
+    if not context.args:
+        await update.message.reply_text(
+            "💰 *Фиксация реального дохода*\n\n"
+            "Формат: `/income 15000 ниши WB для клиента`\n"
+            "Сумма в рублях — копит оборот для потолка НПД.",
+            parse_mode='Markdown'
+        )
+        return
+    try:
+        amount = int(re.sub(r"[^\d]", "", context.args[0]))
+        if amount <= 0:
+            raise ValueError("сумма должна быть > 0")
+    except Exception:
+        await update.message.reply_text(
+            "❌ Формат: `/income 15000 описание`", parse_mode='Markdown'
+        )
+        return
+    desc = " ".join(context.args[1:]) or "без описания"
+    if not nastya_brain.record_income(amount, desc):
+        await update.message.reply_text("❌ Не нашла колонок в earnings для записи.")
+        return
+    m = nastya_brain.money(24)
+    amt  = f"{amount:,}".replace(",", " ")
+    turn = f"{m['turnover_12m']:,}".replace(",", " ")
+    text = (
+        f"✅ *Доход зафиксирован:* {amt}₽\n"
+        f"_{desc}_\n\n"
+        f"🏛 Оборот за 12 мес: {turn}₽ = {m['ceiling_pct']}%"
+    )
+    if m["ceiling_alert"]:
+        text += "\n" + m["ceiling_alert"]
+    await update.message.reply_text(text, parse_mode='Markdown')
+    if LILU_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=LILU_CHAT_ID,
+                text=f"💰 *Настя:* доход {amt}₽ — {desc}",
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            logger.error(f"income -> Лиле: {e}")
+
 
 # ═══ ЗАПУСК ═══
 
@@ -933,6 +990,8 @@ def main():
     app.add_handler(CommandHandler("pending",  pending_command))
     app.add_handler(CommandHandler("report",   report_command))
     app.add_handler(CommandHandler("goals",    goals_command))
+    app.add_handler(CommandHandler("brain",    brain_command))
+    app.add_handler(CommandHandler("income",   income_command))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
