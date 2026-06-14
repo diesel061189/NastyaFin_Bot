@@ -9,7 +9,7 @@ import pytz
 import re
 import nastya_brain  # мозг учёта (живая БД jobs+orders, потолок НПД)
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
 logging.basicConfig(level=logging.INFO)
@@ -58,6 +58,21 @@ PLATFORMS = {
     "other":     "💼 Другое",
     "kwork":     "🟢 Kwork",
 }
+
+# ═══ НИЖНЯЯ КЛАВИАТУРА ═══
+KB_LABELS = {"🧠 Отчёт", "💰 Доход", "🏦 Кошельки", "📊 Система",
+             "🔮 Прогноз", "🔋 Балансы", "📈 Стата", "📤 Лиле"}
+
+MAIN_KB = ReplyKeyboardMarkup(
+    [
+        ["🧠 Отчёт", "💰 Доход"],
+        ["🏦 Кошельки", "📊 Система"],
+        ["🔮 Прогноз", "🔋 Балансы"],
+        ["📈 Стата", "📤 Лиле"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
 
 async def groq_request_smart(messages, max_tokens=300):
     global _groq_model_index
@@ -522,7 +537,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/income — записать реальный доход (потолок НПД)\n\n"
         f"💬 *Или напиши обычным текстом:*\n"
         f"_«потратил 390р на айдентику»_",
-        parse_mode='Markdown'
+        parse_mode='Markdown',
+        reply_markup=MAIN_KB
     )
 
 async def system_analytics_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -769,8 +785,88 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mark_paid(int(data[5:]))
         await query.edit_message_text("✅ Отмечено как оплаченное!")
 
+async def handle_kb_button(update: Update, context: ContextTypes.DEFAULT_TYPE, label: str):
+    if label == "🧠 Отчёт":
+        try:
+            await update.message.reply_text(
+                nastya_brain.build_report(24), parse_mode='Markdown', reply_markup=MAIN_KB
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ Мозг споткнулся: {e}", reply_markup=MAIN_KB)
+    elif label == "💰 Доход":
+        context.user_data['awaiting_income'] = True
+        await update.message.reply_text(
+            "💰 Сколько пришло? Напиши *сумма описание*\n"
+            "Например: `15000 ниши WB`\n\n"
+            "_Любая другая кнопка — отмена._",
+            parse_mode='Markdown', reply_markup=MAIN_KB
+        )
+    elif label == "🏦 Кошельки":
+        await wallets_command(update, context)
+    elif label == "📊 Система":
+        await system_analytics_command(update, context)
+    elif label == "🔮 Прогноз":
+        await forecast_command(update, context)
+    elif label == "🔋 Балансы":
+        await balances_command(update, context)
+    elif label == "📈 Стата":
+        await stats_command(update, context)
+    elif label == "📤 Лиле":
+        await update.message.reply_text("📊 Готовлю отчёт для Лилы...", reply_markup=MAIN_KB)
+        stats = get_stats("month")
+        await send_report_to_lilu(context.application.bot, stats)
+        await update.message.reply_text("✅ Отчёт отправлен Лиле!", reply_markup=MAIN_KB)
+
+
+async def _record_income_from_text(update: Update, context: ContextTypes.DEFAULT_TYPE, raw: str):
+    m = re.match(r"\s*(\d[\d \u00a0]*)\s*(.*)", raw)
+    if not m:
+        await update.message.reply_text("❌ Нужна сумма. Например: `15000 ниши WB`", parse_mode='Markdown', reply_markup=MAIN_KB)
+        return
+    amount = int(re.sub(r"[^\d]", "", m.group(1)))
+    desc = m.group(2).strip() or "без описания"
+    if not nastya_brain.record_income(amount, desc):
+        await update.message.reply_text("❌ Не смогла записать доход.", reply_markup=MAIN_KB)
+        return
+    mny = nastya_brain.money(24)
+    amt = f"{amount:,}".replace(",", " ")
+    turn = f"{mny['turnover_12m']:,}".replace(",", " ")
+    t = (f"✅ *Доход зафиксирован:* {amt}₽\n_{desc}_\n\n"
+         f"🏛 Оборот 12 мес: {turn}₽ = {mny['ceiling_pct']}%")
+    if mny["ceiling_alert"]:
+        t += "\n" + mny["ceiling_alert"]
+    await update.message.reply_text(t, parse_mode='Markdown', reply_markup=MAIN_KB)
+    if LILU_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=LILU_CHAT_ID,
+                text=f"💰 *Настя:* доход {amt}₽ — {desc}",
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            logger.error(f"income kb -> Лиле: {e}")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+
+    # ждём сумму дохода (после кнопки «💰 Доход»)?
+    if context.user_data.get('awaiting_income'):
+        if text in KB_LABELS:
+            context.user_data.pop('awaiting_income', None)
+            await handle_kb_button(update, context, text)
+            return
+        context.user_data.pop('awaiting_income', None)
+        if text and re.search(r"\d", text):
+            await _record_income_from_text(update, context, text)
+        else:
+            await update.message.reply_text("Отменила запись дохода.", reply_markup=MAIN_KB)
+        return
+
+    # нажата кнопка нижней клавиатуры?
+    if text in KB_LABELS:
+        await handle_kb_button(update, context, text)
+        return
 
     if text.startswith('/add '):
         parts = text[5:].split(' ', 2)
@@ -1009,9 +1105,10 @@ def main():
                         f"✅ Время МСК везде\n"
                         f"✅ Отчёт в 9:00 МСК (было 6:00 UTC)\n"
                         f"✅ Алерты если что-то не так\n\n"
-                        f"/system /forecast /wallets"
+                        f"⌨️ Кнопки снизу — жми, не печатай 👇"
                     ),
-                    parse_mode='Markdown'
+                    parse_mode='Markdown',
+                    reply_markup=MAIN_KB
                 )
         except Exception as e:
             logger.error(f"post_init: {e}")
